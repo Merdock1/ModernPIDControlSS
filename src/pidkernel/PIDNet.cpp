@@ -1,4 +1,3 @@
-
 /*
  * Archivo: sfunPID_kernel.c
  * Arquitectura Moderna del Controlador PID de SOMEFUN
@@ -7,227 +6,286 @@
 
 /* Archivos de Inclusión */
 #include "PIDNet.h"
-#include "helpers/norm++kernel.h"
+#include "helpers/norm++kernel.h" // Para normalize/denormalize si se usa, no directamente en este fragmento
+#include <cmath> // Para fabs, fmax (a menudo vía Arduino.h pero es bueno ser explícito)
+
+// Usar las constantes definidas en PIDNet.h
+using namespace pid_net_constants;
 
 /* Inicialización de Instancia */
 PIDNet::PIDNet(double ref, double yout, double dt,
-        int umax_lim, int umin_lim, int dead_max, int dead_min) {
+        int umax_lim, int umin_lim, int dead_max_val, int dead_min_val) {
     follow = 0;
     Ts = dt;
-    T_prev = -dt;
+    T_prev = -Ts; // Inicializar tiempo previo para el primer cálculo de dt, asegurar que sea negativo de Ts
     countseq = 0;
 
     r = ref;
     y = yout;
-    ym = 0;
+    ym = 0; // Valor medido para PID, inicializado
 
-    e = 0;
-    ei = 0;
-    ed = 0;
-
-    up = 0;
-    ui = 0;
-    ud = 0;
-    upd = 0;
-    ua = 0;
-    v = 0;
-    u = 0;
-    uo = 0;
-    e_t = 0;
+    // Inicializar estados a cero
+    e = 0.0;
+    ei = 0.0; 
+    ed = 0.0; 
+    up = 0.0; 
+    ui = 0.0; 
+    ud = 0.0; 
+    upd = 0.0;
+    ua = 0.0; 
+    v = 0.0;  
+    u = 0.0;  
+    uo = 0.0; 
+    e_t = 0.0;
+    uf = 0.0;
+    filter_u.x = 0.0; // Resetear estado del filtro
 
     umax = umax_lim;
     umin = umin_lim;
 
-    this->dead_max = dead_max;
-    this->dead_min = dead_min;
+    this->dead_max = dead_max_val; 
+    this->dead_min = dead_min_val; 
 
-    Kp = 0.001;
-    Ki = 0.0;
-    Kd = 0.0;
-    lambdai = 1;
-    lambdad = 1;
-    Ti = 100;
-    Td = 0;
-    Tf = 0.5;
-    b = 1;
-    c = 0;
+    // Inicializar parámetros PID a valores por defecto
+    Kp = KP_DEFAULT;
+    Ki = KI_DEFAULT;
+    Kd = KD_DEFAULT;
+    lambdai = LAMBDA_I_DEFAULT;
+    lambdad = LAMBDA_D_DEFAULT;
+    Ti = TI_DEFAULT;
+    Td = TD_DEFAULT;
+    this->Tf = TF_FILTER_DEFAULT; // Inicializar miembro Tf (constante de tiempo del filtro para derivativo)
+                                 // Esto se recalculará inmediatamente basado en dt.
+    b = B_2DOF_DEFAULT;
+    c = C_2DOF_DEFAULT;
 
-    /* discretización */
-    double cut_freq = (PI)/(10.0*dt);
-    /* constante de tiempo de lpf (filtro paso bajo) de primer orden para la derivada */
-    // constante bilineal pre-distorsionada y constante de tiempo del filtro
-    //double st = tan(PI/20.0); // Código comentado
-    kpi = cut_freq/TAN_ST;
-    Tf = Ts/(2.0*TAN_ST);
+    /* Discretización e Inicialización del Filtro para la Ruta Derivativa */
+    // dt (Ts) debe ser mayor que cero para estos cálculos
+    double safe_dt = (dt > DIV_BY_ZERO_EPSILON_PID) ? dt : DIV_BY_ZERO_EPSILON_PID;
+    double cut_freq = (PI) / (CUT_FREQ_DIVISOR * safe_dt);
 
-    filter_u;
-    uf = 0;
+    // Constante bilineal pre-distorsionada (kpi) y constante de tiempo del filtro (Tf)
+    // para el filtro paso bajo de primer orden aplicado al término derivativo (ud).
+    // TAN_ST se define en filterFO_pass.h, incluido vía PIDNet.h
+    kpi = cut_freq / (TAN_ST + DIV_BY_ZERO_EPSILON_PID); 
+    this->Tf = Ts / (TF_CALC_DENOMINATOR_SCALING * TAN_ST + DIV_BY_ZERO_EPSILON_PID); // Actualizar miembro Tf
+
+    // Inicializar el objeto filter_u.
+    // filter_u es una instancia de filterFO_pass. Su constructor inicializa su propio
+    // coeficiente Tf_kpi basado en una relación fija (implícitamente fc/fs = 1/20 vía TAN_ST).
+    // Este filtro (filter_u) NO SE UTILIZA actualmente en el método PIDNet::compute()
+    // para filtrar la salida final 'u' o 'uf'. La línea 'u = uf;' usa 'uf' derivado
+    // de 'v - ua', no de filter_u.run().
+    // Si filter_u se usara para la salida principal 'u', sus parámetros probablemente
+    // necesitarían configurarse basados en PIDNet::Ts en lugar de su valor fijo por defecto.
+    filter_u; 
+    uf = 0;   // Inicializar salida ajustada por anti-windup y pre-saturada
 }
 
 /* Definiciones de Funciones */
+
+void PIDNet::reset_state() {
+    T_prev = -Ts; // Consistente con la lógica del constructor para el primer dt si t=0 se pasa a compute
+    countseq = 0;
+    ym = 0.0;   // O considerar r si follow está habilitado y r es conocido, pero 0.0 es un reseteo general
+    e = 0.0;
+    ei = 0.0;
+    ed = 0.0;
+    up = 0.0;
+    ui = 0.0;
+    ud = 0.0;
+    upd = 0.0;
+    ua = 0.0;
+    v = 0.0;
+    u = 0.0;
+    uo = 0.0;
+    e_t = 0.0;
+    uf = 0.0;
+    filter_u.x = 0.0; // Resetear estado interno del filtro no usado filter_u
+}
+
+void PIDNet::set_deadzone(int min_val, int max_val) {
+    this->dead_min = min_val;
+    this->dead_max = max_val;
+}
+
 /*
- *  Esta función implementa el algoritmo de control PID 2-DOF (Dos Grados de Libertad) en realización bilineal.
- * Argumentos    : paramsPID_T *Knet
- * Tipo de Retorno  : void
+ * @brief Calcula la salida de control PID para el paso de tiempo actual.
+ * @details Esta es la función principal de trabajo. Implementa el algoritmo PID 2-DOF
+ *          usando una transformación bilineal para la discretización e incluye un mecanismo anti-windup.
+ *
+ *          La secuencia de cálculo dentro de una sola llamada a compute() es crítica:
+ *          1. Determinar el punto de consigna para el cálculo (ym_calc).
+ *          2. Inicialización Anti-Windup (AWU) y cálculo de la medición ficticia (yfict).
+ *          3. Actualizar los estados Derivativo (ud) e Integral (ui) (usando valores del final del ciclo *previo* de compute).
+ *          4. Calcular Errores Actuales (para el ciclo actual).
+ *          5. Calcular Términos de Salida P, D (para el ciclo actual).
+ *          6. Actualizar término I (segunda parte, usando errores actuales, ua, upd actual).
+ *          7. Calcular Salida Total No Saturada y Aplicar Saturación y Zona Muerta.
+ *
+ * @param t Tiempo actual.
  */
 void PIDNet::compute(const double& t) {
 
-    double ym, yfict, e_u, Keu, ep, kui;
+    // Variables locales para claridad en los cálculos
+    double ym_calc;   // El valor de punto de consigna usado para el cálculo del error (ya sea `r` crudo o `this->ym` filtrado)
+    double yfict;     // Medición ficticia, y ajustada por el término anti-windup ua
+    double e_u;       // Error entre la salida saturada `u` y la salida no saturada `v` (u-v)
+    double Keu;       // Ganancia anti-windup (recíproco de la constante de tiempo de seguimiento Tt)
+    double ep_calc;   // Error proporcional para el cálculo del término P
+    double kui_calc;  // Coeficiente anti-windup integral escalado (KUI_NUMERATOR / Ki)
 
-    T_prev = t;
-    /*  Esquema de Discretización */
-    /*  Parametrización fraccional bilineal */
-    /*  restringir el sintonizador de discretización para que esté dentro de la unidad */
-    /*  límites del círculo de 0 y 1. */
+    // Almacenar tiempo actual como tiempo previo para el cálculo de Ts de la siguiente iteración (si Ts puede cambiar, aunque se fija en el constructor)
+    T_prev = t; 
 
-    /* constante bilineal */
-//    // kpi = 2.0/ Ts; // Código comentado
-//    cut_freq = (PI)/(10.0*Ts); // Código comentado
-//    /* constante de tiempo de lpf (filtro paso bajo) de primer orden para la derivada */
-//    // constante bilineal pre-distorsionada y constante de tiempo del filtro
-//    st = tan(PI/20.0); // Código comentado
-//    kpi = cut_freq/st; // Código comentado
-//    Tf = Ts/(2.0*st); // Código comentado
-
-    /*  Entradas */
+    /* Etapa 1: Determinar Punto de Consigna para Cálculo (ym_calc) */
+    // ym_calc es el punto de consigna usado para los cálculos internos del PID.
+    // Si el modo 'follow' está habilitado, ym_calc se toma de this->ym (que podría ser una versión filtrada de r).
+    // De lo contrario, ym_calc es el punto de consigna crudo 'r', y this->ym también se actualiza a 'r'.
     if (follow==1) {
-        ym = this->ym;
+        ym_calc = this->ym;
+    } else {
+        this->ym = r; 
+        ym_calc = this->ym;
     }
-    else {
-        this->ym = r;
-        ym = this->ym;
-    }
 
-    /*  recálculo de salida AWU, anti-windup */
-    e_u = (u-v);
-    //  Esto cubre una estructura PID desacoplada en lugar del
-    //  recálculo de error que cubre una estructura de 1-DoF (Un Grado de Libertad) solo de error.
-    /*  Coeficiente de recálculo de salida AWUP */
-    Keu = Kp+(0.5*Ts*Ki)+((2/Ts)*Kd);
-    kui = 1.5F/Ki;
-    yfict = y;
-    ua = e_u/Keu;
-    yfict += (ua);
+    /* Etapa 2: Inicialización Anti-Windup (AWU) y Medición Ficticia */
+    // e_u es la diferencia entre la salida de control saturada (u) del ciclo anterior
+    // y la salida no saturada (v) del ciclo anterior.
+    e_u = (u - v); 
 
-    /* Paso Anterior*/
-
-    /*  D */ // Término Derivativo
-    ud *= (kpi*Tf-1); // ud anterior
-    ud -= kpi*Td*(ed); // ed anterior
+    // Keu es la ganancia anti-windup, equivalente a 1/Tt (constante de tiempo de seguimiento).
+    // Se calcula basándose en los parámetros PID actuales. Ts (this->Ts) debe ser > 0.
+    double safe_Ts = (this->Ts > DIV_BY_ZERO_EPSILON_PID) ? this->Ts : DIV_BY_ZERO_EPSILON_PID;
+    Keu = Kp + (KEU_KI_SCALING_FACTOR * safe_Ts * Ki) + ((KEU_KD_TS_SCALING_FACTOR / safe_Ts) * Kd);
     
-    /*  I */ // Término Integral
-    ui += (1/(Ti*kpi))*(ei); // ui y ei anteriores
-    ui -= kui*(upd);
+    // ua es el término de corrección anti-windup. Este término representa cuánto necesita
+    // ajustarse el estado interno del controlador debido a la saturación.
+    ua = e_u / (Keu + DIV_BY_ZERO_EPSILON_PID); 
+    
+    // yfict es una medición "ficticia". Es la medición real 'y' ajustada por 'ua'.
+    // Este yfict es lo que 'y' necesitaría ser para que la 'v' no saturada hubiera sido la
+    // señal de control correcta (saturada) 'u'. Esto es una parte central del anti-windup por back-calculation/tracking.
+    yfict = y + ua; 
 
-    /* Paso Actual */
+    /* Etapa 3: Actualizar Estados D e I (usando valores del final del ciclo *previo*) */
+    // Estos cálculos usan ed, ei, y upd tal como estaban al final de la llamada anterior a compute().
+    
+    /* Término D - Derivativo (parte de predicción basada en ed_prev) */
+    // ud_prev = ud_ciclo_prev * (kpi*Tf - 1) - kpi*Td*ed_ciclo_prev
+    // Nota: 'this->ud', 'this->Tf', 'this->Td', 'this->ed' se usan aquí.
+    // 'this->ed' aún contiene el error derivativo del ciclo *previo* de compute.
+    this->ud *= (kpi * this->Tf - 1.0); 
+    this->ud -= kpi * this->Td * (this->ed);   
+    
+    /* Término I - Integral (primera parte de la actualización, usando ei_prev y upd_prev) */
+    // ui_intermedio = ui_ciclo_prev + (1/(Ti*kpi)) * ei_ciclo_prev - (KUI_NUMERATOR/Ki) * upd_ciclo_prev
+    // 'this->ui', 'this->Ti', 'this->ei', 'this->upd' se usan.
+    // 'this->ei' y 'this->upd' contienen valores del ciclo *previo* de compute.
+    kui_calc = KUI_NUMERATOR / (Ki + DIV_BY_ZERO_EPSILON_PID); // Coeficiente anti-windup/moldeado integral
+    this->ui += (1.0 / (this->Ti * kpi + DIV_BY_ZERO_EPSILON_PID)) * (this->ei); 
+    this->ui -= kui_calc * (this->upd); 
 
-    /*  Errores */
-    ep = (b*ym)-yfict;
-    e = r-y;
-    // recálculo de entrada integral
-    ei = (ym-yfict)+e_u;
-    ed = (c*ym)-yfict;
+    /* Etapa 4: Calcular Errores Actuales (para el ciclo actual) */
+    // ep_calc es el error proporcional, calculado usando ym_calc e yfict (y ajustado por ua).
+    // 'b' es la ponderación del punto de consigna para el término proporcional (2-DOF).
+    ep_calc = (static_cast<double>(b) * ym_calc) - yfict; 
+    
+    // e es el error principal del proceso (punto de consigna crudo - medición cruda).
+    e = r - y;                                     
+    
+    // ei_actual (this->ei) es el error integral para el ciclo actual.
+    // Se basa en la diferencia entre ym_calc e yfict (que incluye el efecto anti-windup 'ua').
+    // Crucialmente, también suma de nuevo e_u (u-v, el error de saturación crudo).
+    // Esta formulación específica significa que el error integral es impulsado por:
+    // 1. (ym_calc - (y+ua)): Error relativo a la medición ajustada por el efecto de saturación.
+    // 2. + (u-v):         Una alimentación directa adicional del error de saturación.
+    // Esto podría estar destinado a hacer el anti-windup más responsivo o a incorporar
+    // aspectos de diferentes estrategias anti-windup.
+    this->ei = (ym_calc - yfict) + e_u;
+    
+    // ed_actual (this->ed) es el error derivativo para el ciclo actual.
+    // 'c' es la ponderación del punto de consigna para el término derivativo (2-DOF).
+    this->ed = (static_cast<double>(c) * ym_calc) - yfict; 
 
-    /*  Términos de Salida Individuales */
-    /*  P */ // Término Proporcional
-    up = (ep);
+    /* Etapa 5: Calcular Términos de Salida P, D (para el ciclo actual) */
+    /* Término P - Proporcional */
+    up = (ep_calc); // Salida proporcional actual
 
-    /*  D */ // Término Derivativo
-    ud += kpi*Td*(ed);
-    ud = ud/(kpi*Tf+1);
+    /* Término D - Derivativo (completar actualización para ciclo actual) */
+    // ud_actual = (ud_intermedio + kpi*Td*ed_actual) / (kpi*Tf + 1)
+    // 'this->ud' fue parcialmente actualizado en Etapa 3 usando ed_prev. Ahora se añade el componente ed_actual.
+    this->ud += kpi * this->Td * (this->ed);
+    // Aplicar filtro paso bajo de primer orden al término derivativo.
+    this->ud = this->ud / (kpi * this->Tf + 1.0 + DIV_BY_ZERO_EPSILON_PID); 
 
-    /* PD */
-    /*  cambio en la contribución P, D, P, D sin saltos. almacena actual a anterior */
-    // error de la contribución PD anterior si es mayor que la salida
-    upd = (up+ud);
+    /* Suma del Término PD (para el ciclo actual) */
+    // upd_actual es la suma de los términos proporcional y derivativo actuales.
+    // Se usará en la segunda parte de la actualización del término integral.
+    this->upd = (up + this->ud);
 
-    /*  I */ // Término Integral
-    ui += (1/(Ti*kpi))*(ei);
-    /*  recálculo de salida integral */
-    ui -= ua;
-    ui += kui*(upd);
+    /* Etapa 6: Actualizar término I (segunda parte, usando ei_actual, ua, upd_actual) */
+    // ui_actual = ui_intermedio_de_etapa3 + (1/(Ti*kpi))*ei_actual - ua + (KUI_NUMERATOR/Ki)*upd_actual
+    
+    // Añadir efecto del error integral actual
+    this->ui += (1.0 / (this->Ti * kpi + DIV_BY_ZERO_EPSILON_PID)) * (this->ei);
+    
+    // Restar corrección anti-windup 'ua' (derivada de e_u y Keu)
+    this->ui -= ua;        
+    
+    // Añadir el segundo término 'kui * upd', esta vez usando el upd *actual*.
+    // Los términos (KUI_NUMERATOR/Ki) * upd (uno restado con upd_prev, uno sumado con upd_actual)
+    // representan una contribución proporcional al cambio en el término PD del ciclo previo al actual,
+    // escalado por 1.5/Ki. Este es un mecanismo de retroalimentación específico dentro del cálculo integral,
+    // potencialmente para moldear la respuesta o como parte de una interacción 2-DOF más compleja.
+    // El factor 1.5 no es estándar para formas PID comunes y probablemente es específico del diseño de este algoritmo.
+    this->ui += kui_calc * (this->upd); 
 
-    /*  Suma de Salida de Términos Contribuyentes */
-    /* Criticar (Evaluar)*/
-    e_t = (up+lambdai*(ui)+lambdad*ud);
-    v = Kp*e_t;
-    /* recálculo de salida combinada */
-    uf = v-ua;
-
-    /*  Restricciones Reales de Entrada de Control para u */
-    //Serial.print("bef_ u="); Serial.println( u); // Código comentado
+    /* Etapa 7: Calcular Salida Total No Saturada y Aplicar Saturación y Zona Muerta */
+    // e_t es la señal de error total ponderada antes de escalar por Kp.
+    // lambdai y lambdad son ponderaciones del punto de consigna para los términos I y D en el error total.
+    e_t = (up + lambdai * (this->ui) + lambdad * (this->ud)); 
+    v = Kp * e_t;  // Salida no saturada del controlador para el ciclo actual.
+    
+    // uf es la salida del controlador después de anti-windup (v-ua) pero antes de saturación.
+    // Sin embargo, 'ua' ya se usó para ajustar 'yfict' y 'ui'.
+    // El cálculo directo aquí es `uf = v - ua` (donde `ua` se basa en `u` y `v` del ciclo *anterior*).
+    // Esto significa que `uf` es la salida no saturada actual `v` corregida por el efecto del error de saturación del ciclo *anterior*.
+    uf = v - ua; 
 
     /* Saturación Dura */
-    //filter_u.run(u,uf); // filtro
-    u = uf;
-    u = fmax((double) umin,fmin(u, (double) umax ));
-    uo = u;
-    //dead_zone<double>(uo, dead_max, dead_min); // Código comentado
-    // uo = fmax((double) umin, fmin(uo, (double) umax )); // Código comentado
+    u = uf; // Asignar esta salida ajustada por anti-windup
+    // Aplicar límites de saturación (umax, umin) a la salida de control u
+    u = fmax(static_cast<double>(umin), fmin(u, static_cast<double>(umax)));
+    uo = u; // uo almacena la salida de control saturada antes de la zona muerta
 
-    /* Mantenimiento Varios. */
-    // incrementar contador interno de muestras para el PID.
-    countseq += 1;
+    // Activar funcionalidad de zona muerta
+    // La función dead_zone modifica uo en el lugar.
+    if (!(dead_min == 0 && dead_max == 0)) { // Aplicar zona muerta solo si los límites no son ambos cero
+        dead_zone<double>(uo, this->dead_max, this->dead_min);
+    }
+    
+    u = uo; // La salida final 'u' es el valor después de la aplicación de la zona muerta.
 
+    countseq += 1; // Incrementar contador interno de muestras
 }
 /**************************************************************************/
 /*!
     @brief  Establece tres parámetros en la estructura de control PID
-    @param b Constante de ponderación del punto de ajuste PID-2DOF: 0 o 1
-    @param c Constante de ponderación derivativa PID-2DOF: 0 o 1
-    @param follow Lógica para habilitar el filtrado del punto de ajuste: 0 o 1
-    @returns void (nada).
+    @param b_new Constante de ponderación del punto de consigna PID-2DOF para el término P: 0 o 1
+    @param c_new Constante de ponderación del punto de consigna PID-2DOF para el término D: 0 o 1
+    @param follow_new Lógica para habilitar el filtrado del punto de consigna: 0 o 1
+    @returns void.
 */
 /**************************************************************************/
-void PIDNet::set_bc_follow(const int& b, const int& c, const char& follow) {
-    this->b = b;
-    this->c = c;
-    this->follow = follow;
+void PIDNet::set_bc_follow(const int& b_new, const int& c_new, const char& follow_new) {
+    this->b = b_new; 
+    this->c = c_new; 
+    this->follow = follow_new;
 }
 
-
-// SATURACIÓN
-// u = maxim((double)  umin, (minim( u, (double)  umax))); // Código comentado
-
-/* Saturación Logística*/
-// nlsig( u, du,  u, (double) umax, (double) umin, // Código comentado
-//        (double) umax, (double) umin, // Código comentado
-//        33, 6, 0, 0); // Código comentado
-//Serial.print("aft_ u="); Serial.println( u); // Código comentado
-
-//    double u_norm[1] = {1.0}; // Código comentado
-//    double u_act[1] = { u}; // Código comentado
-//
-//    //Serial.print("prior: "); Serial.println( u); // Código comentado
-//    normalize<double>(u_act, u_norm,  umax,  umin); // Código comentado
-//    // Serial.print("norm: "); Serial.println(u_norm[0]); // Código comentado
-//    u_norm[0] = nlsig(u_norm[0], 1.0, -1.0, // Código comentado
-//            1.0, -1.0, // Código comentado
-//            33, 6, 0); // Código comentado
-//    //Serial.print("out_norm: "); Serial.println(u_norm[0]); // Código comentado
-//    denormalize<double>(u_norm, u_act,  umax,  umin); // Código comentado
-//     u = u_act[0]; // Código comentado
-//    //Serial.print("after: "); Serial.println( u); // Código comentado
-
-// Serial.print("UPWM: ");Serial.println( u); // depuración
-
-
-//    /* EQUIVALENCIA DE SATURACIÓN, ZONA MUERTA Y FRICCIÓN DE COULOMB */
-//    // NL(.) 1-2 . ZONA MUERTA, mín Y ZONA MUERTA INVERSA, máx
-//    if ((fabs( u) <= fabs( zerotol))) { // Código comentado
-//        // 1. menor o en la zona muerta (límite mínimo)
-//         u = 0; // Código comentado
-//    } else if ((fabs( u) > fabs( zerotol)) && (fabs( u) <= fabs( deadmax))) { // Código comentado
-//        // 2. en la zona muerta inversa (límite máximo)
-//         u = copysign( deadmax,  u); // si u < 0, u = -deadmax
-//    } else { // Código comentado
-//        // 3. fuera de la zona muerta inversa (límite máx)
-//        // deadmax añadido como perturbación, efecto de la fricción de Coulomb en cierto sentido.
-//         u = copysign(fabs( u +  deadmax),  u); // Código comentado
-//    }
-
 /*
- * Trailer de archivo para sfunPID.cpp
+ * Tráiler de archivo para sfunPID.cpp
  *
  * [EOF]
  */
